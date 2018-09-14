@@ -21,7 +21,7 @@ class DataVRP:
             if line.find("DIMENSION") > -1:
                 size = self.sepIntValue(line)
             elif line.find("CAPACITY") > -1:
-                cap = self.sepIntValue(line)
+                self.cap = self.sepIntValue(line)            
             elif line.find("NODE_COORD_SECTION") > -1:
                 i += 1
                 line = lines[i]
@@ -83,41 +83,43 @@ class VRPpricer(Pricer):
     # Patterns currently in the problem:
     patterns = None
 
-    # Dictionary costs[i, j] of moving from i to j:
-    costs = None
-
     # Function used to compute whether a
     # client is visited by a particular pattern.
     isClientVisited = None
 
     # Function used to compute the cost of a pattern:
     patCost = None
+
+    # List of client nodes:
+    clientNodes = []
+
+    # Model that holds the sub-problem:
+    subMIP = None
     
     def __init__(self, z, cons, data, patterns,
                  costs, isClientVisited, patCost):
         
         self.z, self.cons, self.data, self.patterns = z, cons, data, patterns
-        self.costs, self.isClientVisited = costs, isClientVisited
+        self.isClientVisited = isClientVisited
         self.patCost = patCost
-        
+
+        for i in data.nodes:
+            if i != data.depot:
+                self.clientNodes.append(i)
         super()
-    
+
     def pricerredcost(self):
         '''
         This is a method from the Pricer class.
         It is used for adding a new column to the problem.
         '''
-        dualSols = []
-        for i, c in enumerate(self.cons):
-            dualSols.append(self.model.getDualsolLinear(c))
 
-        print(dualSols, "DUALS")
-        subMIP = Model("VRP-Sub")
-        subMIP.setPresolve(SCIP_PARAMSETTING.OFF)
+        colRedCos, pattern = self.getColumnFromMIP(30)  # 30 seconds of time limit
+       
+        if colRedCos < 0.0:
 
-        global ONE_PATTERN
-        if ONE_PATTERN:
-            newPattern = [self.data.depot, 2, 3, 4]
+            newPattern = pattern
+            print(newPattern)
 
             obj = self.patCost(newPattern)
 
@@ -137,8 +139,6 @@ class VRPpricer(Pricer):
             self.patterns.append(newPattern)
             self.z[curVar] = newVar
 
-            ONE_PATTERN = False
-
         return {'result': SCIP_RESULT.SUCCESS}
 
     def pricerinit(self):
@@ -148,7 +148,73 @@ class VRPpricer(Pricer):
         '''
         for i, c in enumerate(self.cons):
             self.cons[i] = self.model.getTransformedCons(c)
-    
+
+    def getColumnFromMIP(self, timeLimit):
+
+        def getPatternFromSolution(subMIP):
+            edges = []
+            for x in subMIP.getVars():
+                if "x" in x.name:
+                    if subMIP.getVal(x) > 0.99:
+                        i, j = x.name.split("_")[1:]
+                        edges.append((int(i), int(j)))
+                    
+            return edges
+
+        # Storing the values of the dual solutions:
+        dualSols = {}
+        for c in self.cons:
+            i = int(c.name.split("_")[-1].strip())
+            dualSols[i] = self.model.getDualsolLinear(c)
+
+        # Model for the sub-problem:
+        subMIP = Model("VRP-Sub")
+        subMIP.setPresolve(SCIP_PARAMSETTING.OFF)
+        subMIP.setMinimize
+
+        subMIP.setRealParam("limits/time", timeLimit)
+        
+        # Binary variables x_ij indicating whether the vehicle
+        # traverses edge (i, j)
+        x = {}
+        for i in self.data.nodes:
+            for j in self.data.nodes:
+                if i != j:
+                    x[i, j] = subMIP.addVar(vtype="B", obj=self.data.costs[i, j], name="x_%d_%d" % (i, j))
+
+        # Binary varaibles p_i indicating whether node i is visited:
+        p = {}
+        for i in self.clientNodes:
+            p[i] = subMIP.addVar(vtype="B", obj=-dualSols[i], name="p_%d" % i)
+                
+        # Non negative variables u_i indicating the demand served up to node i:
+        u = {}
+        for i in self.data.nodes:
+            u[i] = subMIP.addVar(vtype="C", lb=0, ub=self.data.cap, obj=0.0, name="u_%d" % i)
+
+        for j in self.clientNodes:
+            subMIP.addCons(quicksum(x[i, j] for i in self.data.nodes if i != j) >= p[j])
+
+        for h in self.clientNodes:
+            subMIP.addCons(quicksum(x[i, h] for i in self.data.nodes if i != h) ==
+                           quicksum(x[h, i] for i in self.data.nodes if i != h))
+
+        for i in self.data.nodes:
+            for j in self.clientNodes:
+                if i != j:
+                    subMIP.addCons(u[j] >= u[i] + self.data.demands[j]*x[i, j] - self.data.cap*(1 - x[i, j]))
+
+        subMIP.addCons(quicksum(x[self.data.depot, j] for j in self.clientNodes) <= 1)
+
+        subMIP.optimize()
+
+        mipSol = subMIP.getBestSol()
+        obj = subMIP.getSolObjVal(mipSol)
+        
+        pattern = getPatternFromSolution(subMIP)
+        
+        return obj, pattern
+
 
 class VRPsolver:
 
@@ -177,24 +243,23 @@ class VRPsolver:
         
         patterns = []
         for n in self.clientNodes:
-            patterns.append([self.data.depot, n])
+            patterns.append([(self.data.depot, n), (n, self.data.depot)])
 
         self.patterns = patterns
 
     def patCost(self, pat):
         cost = 0.0
 
-        # Adding the depot to the end of the pattern:
-        auxPatterns = pat + [self.data.depot]
-        for (i, n) in enumerate(auxPatterns[:-1]):
-            cost += self.data.costs[n, auxPatterns[i+1]]
-
+        for (i, j) in pat:
+            cost += self.data.costs[i, j]
+            
         return cost
 
     def isClientVisited(self, c, pat):
         # Check if client c if visited in pattern c:
-        if c in pat:
-            return 1
+        for (i, j) in pat:
+            if i == c or j == c:
+                return 1
         return 0
 
     def solve(self):
@@ -242,13 +307,12 @@ class VRPsolver:
         zVars = self.pricer.z
         for i, z in enumerate(zVars):
             if self.master.getVal(zVars[i]) > 0.99:
-                print(z, self.patterns[i])
+                print(zVars[i], self.patterns[i])
 
 
 if __name__ == "__main__":
     data = DataVRP("./data/A-VRP/A-n32-k5.vrp")
     solver = VRPsolver(data)
 
-    solver.patCost([1, 2])
     solver.printSolution()
     
