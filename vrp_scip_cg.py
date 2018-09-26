@@ -131,7 +131,6 @@ class VRPpricer(Pricer):
         
         colRedCos, pattern = self.getColumnFromMIP(30)  # 30 seconds of time limit
 
-        print(pattern, colRedCos)
         if colRedCos < -0.00001:
 
             newPattern = pattern
@@ -299,7 +298,8 @@ class VRPsolver:
         master = Model("Master problem")
 
         # Creating pricer:
-        master.setPresolve(SCIP_PARAMSETTING.OFF)
+        if not integer:
+            master.setPresolve(SCIP_PARAMSETTING.OFF)
 
         # Populating master model.
         # Binary variables z_r indicating whether
@@ -313,8 +313,6 @@ class VRPsolver:
         # Set objective:
         master.setObjective(quicksum(self.patCost(p)*z[i] for i, p in enumerate(self.patterns)),
                             "minimize")
-        
-        print(master.getObjective())
 
         clientCons = [None]*len(self.clientNodes)
         
@@ -334,7 +332,12 @@ class VRPsolver:
             master.includePricer(pricer, "VRP pricer", "Identifying new routes")
 
             self.pricer = pricer
-            
+
+        if integer:
+            print("Finding the best patterns among:")
+            for p in self.patterns:
+                print(p)
+
         self.master = master  # Save master model.
         
         master.optimize()
@@ -369,7 +372,7 @@ class VRPsolver:
 
 if __name__ == "__main__":
     data = DataVRP("./data/A-VRP/A-n32-k5.vrp")
-#    data = DataVRP("toy15.vrp")
+    #    data = DataVRP("toy15.vrp")
 
     solver = VRPsolver(data, 180)
     solver.solve()
@@ -377,8 +380,8 @@ if __name__ == "__main__":
     usedPatterns = solver.printSolution()
     solver.drawSolution()
 
-    solver.genInitialPatterns()
-    solver.addPatterns(usedPatterns)
+    solver.setInitialPatterns(solver.patterns)
+#    solver.addPatterns(solver.patterns)
 
     solver.solve(integer=True)
 
